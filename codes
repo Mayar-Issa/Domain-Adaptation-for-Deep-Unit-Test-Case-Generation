@@ -1,1 +1,2452 @@
 codes
+import ast
+import os
+import torch
+import glob
+import logging
+import pickle
+import datasets
+import pandas as pd
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from transformers import AutoModelForSeq2SeqLM, AutoModelForCausalLM, AutoTokenizer, PLBartForCausalLM, \
+            DataCollatorForSeq2Seq, DataCollatorForLanguageModeling
+
+
+#########################
+######## config #########
+model_name = 'gpt2'
+model_dir  = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/save/APPS/gpt2-large/checkpoint-8257'
+test_dataset_folder = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Dataset/Evaluation/Csv'  # Change to the folder path
+input_column = 'description' 
+output_column = 'test_case'
+processed = False
+
+output_dir = model_dir
+output_suffix = '_testcase'
+
+batch_size = 4
+beam_size = 4
+max_new_tokens = 500  # Overwrite max_length
+max_length = 1024
+
+gpu_num = '0'
+
+output_parent_dir = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Output/Csv'  # Change this to the parent directory where you want to save the .txt files
+
+#########################
+
+def generate(model, input_ids, attention_mask, max_new_tokens, num_beams, test_method, **kwargs):
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pad_token_id=tokenizer.eos_token_id,
+            max_new_tokens=max_new_tokens,
+            num_return_sequences=num_beams,
+            num_beams=num_beams,
+            early_stopping=True,
+            max_time=30
+        )
+
+        decoded_outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+        processed_outputs = []
+        for i in range(0, len(decoded_outputs), num_beams):
+            batch_outputs = decoded_outputs[i:i+num_beams]
+            processed_outputs.append(batch_outputs)
+
+# Iterate through CSV files in the folder
+for csv_file_path in glob.glob(os.path.join(test_dataset_folder, '*.csv')):
+    # Load the CSV test dataset
+    test_df = pd.read_csv(csv_file_path, delimiter='\t')
+
+     # Create a directory for saving the output .txt files
+    csv_file_name = os.path.splitext(os.path.basename(csv_file_path))[0]
+    output_dir = os.path.join('/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Output/Csv', csv_file_name)
+    # os.makedirs(output_dir, exist_ok=True)  # Ensure the directory exists
+
+
+    # Load the trained model and initialize the tokenizer
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, 
+                                              padding_side='left',  # Set padding_side to 'left'
+                                              truncation_side='left',  # Adjust truncation_side if needed
+                                              do_lower_case=False
+                                             )
+
+    if model_name == 'gpt2':
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer.pad_token = tokenizer.eos_token  # Set the padding token to the EOS token
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+        )
+    # Tokenize the inputs for the test dataset
+    test_inputs_text = list(test_df[input_column])
+    test_inputs = tokenizer(test_inputs_text, padding=True, truncation=True, max_length=max_length)
+
+    # Convert the tokenized inputs into a PyTorch dataset
+    test_dataset = datasets.Dataset.from_dict({
+        "input_ids": test_inputs["input_ids"],
+        "attention_mask": test_inputs["attention_mask"],
+    })
+
+    # Create PyTorch dataloaders for the test dataset
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=DataCollatorForSeq2Seq(tokenizer) if 'bigscience/bloom-560m' in model_name else DataCollatorForLanguageModeling(tokenizer, mlm=False))
+
+    # Generate predictions on the test dataset
+    predictions = []
+    raw_outputs = []
+    skip_special_tokens = not (processed and model_name in ['gpt2', 'codegpt', 'pycoder'])
+
+    for batch in tqdm(test_loader):
+        with torch.no_grad():
+            input_ids = batch["input_ids"].to('cpu')
+            attention_mask = batch["attention_mask"].to('cpu')
+
+            # Generate test case predictions
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pad_token_id=tokenizer.eos_token_id,
+                max_new_tokens=max_new_tokens,
+                num_return_sequences=beam_size,
+                num_beams=beam_size,
+                early_stopping=True,
+                max_time=30
+            )
+
+            # Post-process the generated outputs
+            outputs = outputs[:, input_ids.shape[-1]:]  # Trim output to only generated tokens
+            decoded_outputs = tokenizer.batch_decode(outputs, skip_special_tokens=skip_special_tokens, clean_up_tokenization_spaces=False)
+
+            # Process decoded outputs to ensure correctness (modify this part as needed)
+            processed_outputs = []
+            for i in range(0, len(decoded_outputs), beam_size):
+                batch_outputs = decoded_outputs[i:i+beam_size]
+                processed_outputs.append(batch_outputs)  # Ensure this step correctly separates batches
+
+            predictions.extend(processed_outputs)
+
+            # Store raw outputs for debugging
+            raw_outputs.append([outputs[i:i+beam_size] for i in range(0, len(outputs), beam_size)])
+
+    first_predictions = [pred[0] for pred in predictions]
+    output_txt_path = os.path.splitext(output_dir)[0] + '.txt'
+
+    with open(output_txt_path, 'w') as f:
+        for data in first_predictions:
+          print(data)
+          f.write(data + '\n')
+
+import pandas as pd
+import pickle
+import json
+import openai
+import time
+from tqdm import tqdm
+import os.path
+from tenacity import ( retry, stop_after_attempt, wait_random_exponential ) # for exponential backoff
+import argparse
+
+parser.add_argument('--train', '-t', type=str, help='The path to the train TSV file.')
+parser.add_argument('--test', '-s', type=str, help='The path to the test TSV file.')
+args = parser.parse_args()
+
+train_file = args.train
+test_file = args.test
+
+input_column = 'Description'
+output_column = 'test_case'
+
+train_dataset_path = train_file
+test_dataset_path = test_file
+
+# Reading the train and test files
+df_train = pd.read_csv(train_dataset_path,delimiter='\t')
+df_test = pd.read_csv(test_dataset_path,delimiter='\t')
+
+#Setting up the fine-tuning parameters
+fine_tuning_data = []
+
+for i in tqdm(range(len(df_train))):
+    description_content = df_train[input_column][i]
+    test_case = df_train[output_column][i]
+    fine_tuning_data.append({
+        "prompt": description_content,
+        "completion": test_case
+    })
+
+# Fine-tuning the GPT-3.5 model
+openai.api_key = json.load(open('access_token.json'))['openai_access_token']
+
+fine_tuning_response = openai.CreateFineTuneJob.create(
+    training_set=fine_tuning_data,
+    model="gpt-3.5-turbo"
+)
+
+# Waiting for the fine-tuning job to complete
+fine_tuning_job = openai.FineTuneJob.retrieve(fine_tuning_response["id"])
+while fine_tuning_job["status"] != "completed":
+    time.sleep(60)
+    fine_tuning_job = openai.FineTuneJob.retrieve(fine_tuning_response["id"])
+
+# Using the fine-tuned model to generate test cases
+@retry(wait=wait_random_exponential(min=0.3, max=2), stop=stop_after_attempt(6))
+def completion_with_backoff(**kwargs):
+    return openai.ChatCompletion.create(**kwargs)
+
+openai.api_key = key
+openai_completions = []
+curr_idx = 0
+skip = False
+if os.path.isfile('save/openai_gpt35_apps_testcase.json'):
+    skip = True
+    rfile = open('save/openai_gpt35_apps_testcase.json', "r")
+    curr_idx = len(rfile.readlines())
+    rfile.close()
+file = open('save/openai_gpt35_apps_testcase.json', "a")
+for i in tqdm(range(len(df_test))):
+    if i < curr_idx:
+        continue
+    if skip:
+        print(f'continue at idx: {i}')
+        skip = False
+        description_content = "Write a JUnit Test Case for the description provided : " + df_test[input_column][i]
+    completion = completion_with_backoff(
+        model=fine_tuning_job["engine"],
+        messages=[
+            {"role": "user", "content": description_content}
+        ],
+        max_tokens=300
+    )
+    openai_completions.append(completion)
+    save_obj = {'idx': i, 'response': completion}
+    json_str = json.dumps(save_obj)
+    file.write(json_str + '\n')
+    time.sleep(1)
+file.close()
+with open('save/openai_gpt35_apps_testcase.pkl', 'wb') as f:
+    pickle.dump(openai_completions, f)
+
+import pandas as pd
+import numpy as np
+import os
+import logging
+import torch
+import argparse
+from transformers import BloomTokenizerFast, get_scheduler
+# from unixcoder import UniXcoder
+from sklearn.model_selection import train_test_split
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, \
+                        GPT2Config, GPT2Model, RobertaModel, PLBartForCausalLM, \
+                        Trainer, TrainingArguments, \
+                        DataCollatorForSeq2Seq, DataCollatorForLanguageModeling
+
+parser = argparse.ArgumentParser(description='Description of your script.')
+
+parser.add_argument('--input', '-i', type=str, help='The path to the TSV file.')
+args = parser.parse_args()
+
+input_file = args.input
+#########################
+######## config #########
+# export CUDA_VISIBLE_DEVICES=0
+model_name = 'codet5-large'
+model_name = 'bigscience/bloom-560m'
+is_shuffle = True
+
+train_dataset_path = input_file
+# eval_dataset_path = 'dataset/APPS/apps_processed_eval.csv' # not use
+input_column = 'description'
+output_column = 'test_case'
+output_dir = 'save/APPS/codet5-code-v2'
+output_dir = 'save/APPS/bloom_eval'
+
+# gpu_num = '0'
+
+#########################
+model_name = model_name.lower()
+base_model = {
+    'pycoder': AutoModelForCausalLM,
+    'codegpt': AutoModelForCausalLM,
+    'transformers': GPT2Model,
+    'gpt2': AutoModelForCausalLM,
+    'codet5-small': AutoModelForSeq2SeqLM,
+    'codet5-base': AutoModelForSeq2SeqLM,
+    'codet5-large': AutoModelForSeq2SeqLM,
+    # 'unixcoder': UniXcoder,
+    'plbart': PLBartForCausalLM,
+    'bloom' : AutoModelForCausalLM
+}
+base_checkpoint = {
+    'pycoder': 'Wannita/PyCoder',
+    'codegpt': 'microsoft/CodeGPT-small-py',
+    'transformers': 'gpt2_no_pretrain_weight',
+    'gpt2': 'gpt2',
+    'codet5-small': 'Salesforce/codet5-small',
+    'codet5-base': 'Salesforce/codet5-base',
+    'codet5-large': 'Salesforce/codet5-large',
+    'unixcoder': 'microsoft/unixcoder-base',
+    'plbart': 'uclanlp/plbart-base',
+}
+# os.environ["CUDA_VISIBLE_DEVICES"] = gpu_num
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+# Set logging
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+log_file = output_dir + '/train.log'
+logger = logging.getLogger(__name__)
+logging.basicConfig(filename=log_file, filemode='a', format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+logger.addHandler(logging.StreamHandler())
+logger.info(f"Is CUDA available: {torch.cuda.is_available()}")
+logger.info(f"CUDA device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+device = "cuda" 
+
+# Initialize the tokenizer, model
+if model_name == 'transformers':
+    config = GPT2Config()
+    tokenizer = AutoTokenizer.from_pretrained('gpt2', truncation_side='left', do_lower_case=False)
+    tokenizer.pad_token = tokenizer.eos_token
+    model = base_model[model_name](config)
+elif model_name == 'unixcoder':
+    config =AutoConfig.from_pretrained(base_checkpoint[model_name])
+    config.is_decoder = True
+    tokenizer = AutoTokenizer.from_pretrained(base_checkpoint[model_name], truncation_side='left', do_lower_case=False)
+    encoder = RobertaModel.from_pretrained(base_checkpoint[model_name],config=config)
+    model=Seq2Seq(encoder=encoder,decoder=encoder,config=config,
+                  beam_size=5,max_length=512,
+                  sos_id=tokenizer.cls_token_id,eos_id=[tokenizer.sep_token_id])
+else:
+    tokenizer = None
+    if model_name == 'bigscience/bloom-560m':
+        tokenizer = BloomTokenizerFast.from_pretrained(model_name)
+        tokenizer.padding_side = 'right'
+        tokenizer.model_max_length = 256
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+        ).to('cuda')
+    if model_name == 'gpt2':
+        tokenizer.pad_token = tokenizer.eos_token
+    if model_name == 'plbart':
+        model = base_model[model_name].from_pretrained(base_checkpoint[model_name], add_cross_attention=False)
+        assert model.config.is_decoder, f"{model.__class__} has to be configured as a decoder."
+    
+logger.info('loaded model and tokenizer sucessfully.')
+
+# Load the CSV
+train_df = pd.read_csv(train_dataset_path,delimiter='\t')
+# eval_df = pd.read_csv(eval_dataset_path)
+# print("null input:", len(train_df[input_column].dropna()))
+# print("null output:", len(train_df[output_column].dropna()))
+train_df, eval_df = train_test_split(train_df, test_size=0.1, random_state=42, shuffle=is_shuffle)
+
+# Convert the tokenized inputs and outputs into a PyTorch dataset
+class MyDataset(torch.utils.data.Dataset):
+    def __init__(self, inputs, outputs):
+        self.inputs = inputs
+        self.outputs = outputs
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": torch.tensor(self.inputs["input_ids"][idx]),
+            "attention_mask": torch.tensor(self.inputs["attention_mask"][idx]),
+            # "decoder_input_ids": torch.tensor(self.outputs["input_ids"][idx]),
+            # "decoder_attention_mask": torch.tensor(self.outputs["attention_mask"][idx]),
+            "labels": torch.tensor(self.outputs["input_ids"][idx]),
+        }
+
+    def __len__(self):
+        return len(self.inputs["input_ids"])
+
+# Tokenize the inputs and outputs
+# Convert the tokenized inputs and outputs into a PyTorch dataset
+train_inputs = tokenizer(list(train_df[input_column]), padding=True, truncation=True, max_length=512)
+train_outputs = tokenizer(list(train_df[output_column]), padding=True, truncation=True, max_length=512)
+train_dataset = MyDataset(train_inputs, train_outputs)
+
+eval_inputs = tokenizer(list(eval_df[input_column]), padding=True, truncation=True, max_length=512)
+eval_outputs = tokenizer(list(eval_df[output_column]), padding=True, truncation=True, max_length=512)
+eval_dataset = MyDataset(eval_inputs, eval_outputs)
+logger.info('loaded dataset sucessfully.')
+
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    learning_rate=2e-5, #1.5e-5,
+    weight_decay=0.01,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    gradient_accumulation_steps=4,
+    # predict_with_generate=True,
+    num_train_epochs=20,
+    logging_strategy="steps",
+    logging_steps=500,
+    save_strategy="epoch",
+    eval_accumulation_steps=1,
+    evaluation_strategy="epoch",
+    warmup_steps=1000,
+    fp16=True,
+    save_total_limit=10,
+    optim="adamw_torch",
+    lr_scheduler_type = "inverse_sqrt"
+)
+logger.info(f'''training_args: lr={training_args.learning_rate},
+            batch_size={training_args.per_device_train_batch_size},
+            epoch={training_args.num_train_epochs},
+            gradient_accumulation_steps={training_args.gradient_accumulation_steps},
+            warmup_steps={training_args.warmup_steps},
+            weight_decay={training_args.weight_decay},
+            optim={training_args.optim},
+            lr_scheduler_type={training_args.lr_scheduler_type},
+            fp16={training_args.fp16}
+            ''')
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=DataCollatorForSeq2Seq(tokenizer) if 'codet5' in model_name else DataCollatorForLanguageModeling(tokenizer, mlm=False),
+    tokenizer=tokenizer,
+)
+
+trainer.train()
+import pandas as pd
+import numpy as np
+import os
+import logging
+import torch
+import json
+import argparse
+from transformers import RobertaTokenizer, get_scheduler
+# from unixcoder import UniXcoder
+from sklearn.model_selection import train_test_split
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, \
+                        GPT2Config, GPT2Model, RobertaModel, PLBartForCausalLM, \
+                        Trainer, TrainingArguments, \
+                        DataCollatorForSeq2Seq, DataCollatorForLanguageModeling, T5ForConditionalGeneration
+from transformers import AutoTokenizer
+
+# Initialize the tokenizer
+tokenizer = AutoTokenizer.from_pretrained("bigcode/starcoder")
+
+parser = argparse.ArgumentParser(description='Description of your script.')
+
+parser.add_argument('--input', '-i', type=str, help='The path to the TSV file.')
+args = parser.parse_args()
+
+input_file = args.input
+#########################
+######## config #########
+# export CUDA_VISIBLE_DEVICES=0
+api_key = json.load(open('access_token copy.json'))
+access_token = api_key['hf_access_token']
+model_name = 'bigcode/starcoder'
+is_shuffle = True
+
+train_dataset_path = input_file
+# eval_dataset_path = 'dataset/APPS/apps_processed_eval.csv' # not use
+input_column = 'description'
+output_column = 'test_case'
+output_dir = 'save/bigcode/starcoder'
+
+# gpu_num = '0'
+
+#########################
+model_name = model_name.lower()
+base_model = {
+    'pycoder': AutoModelForCausalLM,
+    'codegpt': AutoModelForCausalLM,
+    'transformers': GPT2Model,
+    'gpt2': AutoModelForCausalLM,
+    'codet5-large': AutoModelForSeq2SeqLM,
+    'codet5-large': AutoModelForSeq2SeqLM,
+    'starcoder': AutoModelForSeq2SeqLM,
+   
+}
+base_checkpoint = {
+    'pycoder': 'Wannita/PyCoder',
+    'codegpt': 'microsoft/CodeGPT-small-py',
+    'transformers': 'gpt2_no_pretrain_weight',
+    'gpt2': 'gpt2',
+    'codet5-large': 'Salesforce/codet5-large',
+    'codet5-large': 'Salesforce/codet5-large',
+    'starcoder': 'bigcode/starcoder',
+    'unixcoder': 'microsoft/unixcoder-base',
+    'plbart': 'uclanlp/plbart-base',
+}
+# os.environ["CUDA_VISIBLE_DEVICES"] = gpu_num
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+# Set logging
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+log_file = output_dir + '/train.log'
+logger = logging.getLogger(__name__)
+logging.basicConfig(filename=log_file, filemode='a', format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+logger.addHandler(logging.StreamHandler())
+logger.info(f"Is CUDA available: {torch.cuda.is_available()}")
+logger.info(f"CUDA device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+device = "cuda" 
+
+# Initialize the tokenizer, model
+if model_name == 'transformers':
+    config = GPT2Config()
+    tokenizer = AutoTokenizer.from_pretrained('gpt2', truncation_side='left', do_lower_case=False)
+    tokenizer.pad_token = tokenizer.eos_token
+    model = base_model[model_name](config)
+elif model_name == 'unixcoder':
+    config =AutoConfig.from_pretrained(base_checkpoint[model_name])
+    config.is_decoder = True
+    tokenizer = AutoTokenizer.from_pretrained(base_checkpoint[model_name], truncation_side='left', do_lower_case=False)
+    encoder = RobertaModel.from_pretrained(base_checkpoint[model_name],config=config)
+    model=Seq2Seq(encoder=encoder,decoder=encoder,config=config,
+                  beam_size=5,max_length=512,
+                  sos_id=tokenizer.cls_token_id,eos_id=[tokenizer.sep_token_id])
+else:
+    tokenizer = None
+    if model_name == 'bigcode/starcoder':
+        tokenizer = RobertaTokenizer.from_pretrained(model_name)
+        tokenizer.padding_side = 'right'
+        tokenizer.model_max_length = 256
+        model = T5ForConditionalGeneration.from_pretrained(
+            model_name,
+        ).to('cuda')
+    
+logger.info('loaded model and tokenizer sucessfully.')
+
+# Load the CSV
+train_df = pd.read_csv(train_dataset_path, delimiter='\t', error_bad_lines=False, skip_blank_lines=True)
+
+# eval_df = pd.read_csv(eval_dataset_path)
+# print("null input:", len(train_df[input_column].dropna()))
+# print("null output:", len(train_df[output_column].dropna()))
+train_df, eval_df = train_test_split(train_df, test_size=0.1, random_state=42, shuffle=is_shuffle)
+
+# Convert the tokenized inputs and outputs into a PyTorch dataset
+class MyDataset(torch.utils.data.Dataset):
+    def __init__(self, inputs, outputs):
+        self.inputs = inputs
+        self.outputs = outputs
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": torch.tensor(self.inputs["input_ids"][idx]),
+            "attention_mask": torch.tensor(self.inputs["attention_mask"][idx]),
+            # "decoder_input_ids": torch.tensor(self.outputs["input_ids"][idx]),
+            # "decoder_attention_mask": torch.tensor(self.outputs["attention_mask"][idx]),
+            "labels": torch.tensor(self.outputs["input_ids"][idx]),
+        }
+
+    def __len__(self):
+        return len(self.inputs["input_ids"])
+
+# Tokenize the inputs and outputs
+# Convert the tokenized inputs and outputs into a PyTorch dataset
+print(train_df.columns)
+print(input_column)
+print(output_column)
+# Define the input column
+input_column = 'description'  # Replace with the actual column name
+
+# Tokenize the input
+train_inputs = tokenizer(list(train_df[input_column]), padding=True, truncation=True, max_length=512)
+train_outputs = tokenizer(list(train_df[output_column]), padding=True, truncation=True, max_length=512)
+train_dataset = MyDataset(train_inputs, train_outputs)
+
+eval_inputs = tokenizer(list(eval_df[input_column]), padding=True, truncation=True, max_length=512)
+eval_outputs = tokenizer(list(eval_df[output_column]), padding=True, truncation=True, max_length=512)
+eval_dataset = MyDataset(eval_inputs, eval_outputs)
+logger.info('loaded dataset sucessfully.')
+
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    learning_rate=2e-5, #1.5e-5,
+    weight_decay=0.01,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    gradient_accumulation_steps=4,
+    # predict_with_generate=True,
+    num_train_epochs=20,
+    logging_strategy="steps",
+    logging_steps=500,
+    save_strategy="epoch",
+    eval_accumulation_steps=1,
+    evaluation_strategy="epoch",
+    warmup_steps=1000,
+    fp16=True,
+    save_total_limit=10,
+    optim="adamw_torch",
+    lr_scheduler_type = "inverse_sqrt"
+)
+logger.info(f'''training_args: lr={training_args.learning_rate},
+            batch_size={training_args.per_device_train_batch_size},
+            epoch={training_args.num_train_epochs},
+            gradient_accumulation_steps={training_args.gradient_accumulation_steps},
+            warmup_steps={training_args.warmup_steps},
+            weight_decay={training_args.weight_decay},
+            optim={training_args.optim},
+            lr_scheduler_type={training_args.lr_scheduler_type},
+            fp16={training_args.fp16}
+            ''')
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=DataCollatorForSeq2Seq(tokenizer) if 'starcoder' in model_name else DataCollatorForLanguageModeling(tokenizer, mlm=False),
+    tokenizer=tokenizer,
+)
+
+trainer.train()
+import pandas as pd
+import numpy as np
+import os
+import logging
+import torch
+import argparse
+from transformers import RobertaTokenizer, get_scheduler
+# from unixcoder import UniXcoder
+from sklearn.model_selection import train_test_split
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, \
+                        GPT2Config, GPT2Model, RobertaModel, PLBartForCausalLM, \
+                        Trainer, TrainingArguments, \
+                        DataCollatorForSeq2Seq, DataCollatorForLanguageModeling, T5ForConditionalGeneration
+from transformers import T5Tokenizer
+
+# Initialize the tokenizer
+tokenizer = T5Tokenizer.from_pretrained("t5-small")
+
+parser = argparse.ArgumentParser(description='Description of your script.')
+
+parser.add_argument('--input', '-i', type=str, help='The path to the TSV file.')
+args = parser.parse_args()
+
+input_file = args.input
+#########################
+######## config #########
+# export CUDA_VISIBLE_DEVICES=0
+model_name = 'codet5-large'
+is_shuffle = True
+
+train_dataset_path = input_file
+# eval_dataset_path = 'dataset/APPS/apps_processed_eval.csv' # not use
+input_column = 'description'
+output_column = 'test_case'
+output_dir = 'save/APPS/codet5-code-v2'
+
+# gpu_num = '0'
+
+#########################
+model_name = model_name.lower()
+base_model = {
+    'pycoder': AutoModelForCausalLM,
+    'codegpt': AutoModelForCausalLM,
+    'transformers': GPT2Model,
+    'gpt2': AutoModelForCausalLM,
+    'codet5-large': AutoModelForSeq2SeqLM,
+    'codet5-large': AutoModelForSeq2SeqLM,
+    'codet5-large': AutoModelForSeq2SeqLM,
+   
+}
+base_checkpoint = {
+    'pycoder': 'Wannita/PyCoder',
+    'codegpt': 'microsoft/CodeGPT-small-py',
+    'transformers': 'gpt2_no_pretrain_weight',
+    'gpt2': 'gpt2',
+    'codet5-large': 'Salesforce/codet5-large',
+    'codet5-large': 'Salesforce/codet5-large',
+    'codet5-large': 'Salesforce/codet5-large',
+    'unixcoder': 'microsoft/unixcoder-base',
+    'plbart': 'uclanlp/plbart-base',
+}
+# os.environ["CUDA_VISIBLE_DEVICES"] = gpu_num
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+# Set logging
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+log_file = output_dir + '/train.log'
+logger = logging.getLogger(__name__)
+logging.basicConfig(filename=log_file, filemode='a', format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+logger.addHandler(logging.StreamHandler())
+logger.info(f"Is CUDA available: {torch.cuda.is_available()}")
+logger.info(f"CUDA device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+device = "cuda" 
+
+# Initialize the tokenizer, model
+if model_name == 'transformers':
+    config = GPT2Config()
+    tokenizer = AutoTokenizer.from_pretrained('gpt2', truncation_side='left', do_lower_case=False)
+    tokenizer.pad_token = tokenizer.eos_token
+    model = base_model[model_name](config)
+elif model_name == 'unixcoder':
+    config =AutoConfig.from_pretrained(base_checkpoint[model_name])
+    config.is_decoder = True
+    tokenizer = AutoTokenizer.from_pretrained(base_checkpoint[model_name], truncation_side='left', do_lower_case=False)
+    encoder = RobertaModel.from_pretrained(base_checkpoint[model_name],config=config)
+    model=Seq2Seq(encoder=encoder,decoder=encoder,config=config,
+                  beam_size=5,max_length=512,
+                  sos_id=tokenizer.cls_token_id,eos_id=[tokenizer.sep_token_id])
+else:
+    tokenizer = None
+    if model_name == 'Salesforce/codet5-large':
+        tokenizer = RobertaTokenizer.from_pretrained(model_name)
+        tokenizer.padding_side = 'right'
+        tokenizer.model_max_length = 256
+        model = T5ForConditionalGeneration.from_pretrained(
+            model_name,
+        ).to('cuda')
+    
+logger.info('loaded model and tokenizer sucessfully.')
+
+# Load the CSV
+train_df = pd.read_csv(train_dataset_path, delimiter='\t', error_bad_lines=False, skip_blank_lines=True)
+
+# eval_df = pd.read_csv(eval_dataset_path)
+# print("null input:", len(train_df[input_column].dropna()))
+# print("null output:", len(train_df[output_column].dropna()))
+train_df, eval_df = train_test_split(train_df, test_size=0.1, random_state=42, shuffle=is_shuffle)
+
+# Convert the tokenized inputs and outputs into a PyTorch dataset
+class MyDataset(torch.utils.data.Dataset):
+    def __init__(self, inputs, outputs):
+        self.inputs = inputs
+        self.outputs = outputs
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": torch.tensor(self.inputs["input_ids"][idx]),
+            "attention_mask": torch.tensor(self.inputs["attention_mask"][idx]),
+            # "decoder_input_ids": torch.tensor(self.outputs["input_ids"][idx]),
+            # "decoder_attention_mask": torch.tensor(self.outputs["attention_mask"][idx]),
+            "labels": torch.tensor(self.outputs["input_ids"][idx]),
+        }
+
+    def __len__(self):
+        return len(self.inputs["input_ids"])
+
+# Tokenize the inputs and outputs
+# Convert the tokenized inputs and outputs into a PyTorch dataset
+print(train_df.columns)
+print(input_column)
+print(output_column)
+# Define the input column
+input_column = 'description'  # Replace with the actual column name
+
+# Tokenize the input
+train_inputs = tokenizer(list(train_df[input_column]), padding=True, truncation=True, max_length=512)
+train_outputs = tokenizer(list(train_df[output_column]), padding=True, truncation=True, max_length=512)
+train_dataset = MyDataset(train_inputs, train_outputs)
+
+eval_inputs = tokenizer(list(eval_df[input_column]), padding=True, truncation=True, max_length=512)
+eval_outputs = tokenizer(list(eval_df[output_column]), padding=True, truncation=True, max_length=512)
+eval_dataset = MyDataset(eval_inputs, eval_outputs)
+logger.info('loaded dataset sucessfully.')
+
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    learning_rate=2e-5, #1.5e-5,
+    weight_decay=0.01,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    gradient_accumulation_steps=4,
+    # predict_with_generate=True,
+    num_train_epochs=20,
+    logging_strategy="steps",
+    logging_steps=500,
+    save_strategy="epoch",
+    eval_accumulation_steps=1,
+    evaluation_strategy="epoch",
+    warmup_steps=1000,
+    fp16=True,
+    save_total_limit=10,
+    optim="adamw_torch",
+    lr_scheduler_type = "inverse_sqrt"
+)
+logger.info(f'''training_args: lr={training_args.learning_rate},
+            batch_size={training_args.per_device_train_batch_size},
+            epoch={training_args.num_train_epochs},
+            gradient_accumulation_steps={training_args.gradient_accumulation_steps},
+            warmup_steps={training_args.warmup_steps},
+            weight_decay={training_args.weight_decay},
+            optim={training_args.optim},
+            lr_scheduler_type={training_args.lr_scheduler_type},
+            fp16={training_args.fp16}
+            ''')
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=DataCollatorForSeq2Seq(tokenizer) if 'codet5' in model_name else DataCollatorForLanguageModeling(tokenizer, mlm=False),
+    tokenizer=tokenizer,
+)
+
+trainer.train()
+import pandas as pd
+import numpy as np
+import os
+import logging
+import json
+import torch
+import argparse
+from transformers import RobertaTokenizer, get_scheduler
+# from unixcoder import UniXcoder
+from sklearn.model_selection import train_test_split
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, \
+                        GPT2Config, GPT2Model, RobertaModel, PLBartForCausalLM, \
+                        Trainer, TrainingArguments, \
+                        DataCollatorForSeq2Seq, DataCollatorForLanguageModeling, T5ForConditionalGeneration
+from transformers import AutoTokenizer
+
+
+token = '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'
+tokenizer = AutoTokenizer.from_pretrained("bigcode/starcoder", revision="main", token=token)
+model = AutoModelForCausalLM.from_pretrained("bigcode/starcoder", revision="main", token=token)
+
+parser = argparse.ArgumentParser(description='Description of your script.')
+
+parser.add_argument('--input', '-i', type=str, help='The path to the TSV file.')
+args = parser.parse_args()
+
+input_file = args.input
+#########################
+######## config #########
+# export CUDA_VISIBLE_DEVICES=0
+
+
+checkpoint = "bigcode/starcoder"
+input_dir = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Dataset/Test/CSVFormat.csv'
+input_column = 'description'
+output_filename = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Output/Csv'  # Specify your output directory
+output_suffix = '_testcase'
+batch_size = 1
+
+# Initialize the StarCoder model and tokenizer
+device = "cuda"
+tokenizer = AutoTokenizer.from_pretrained(checkpoint,  cache_dir='/HDD18TB/saranya/LLM_HF')
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = 'left'
+tokenizer.truncation_side = 'left'
+model = AutoModelForCausalLM.from_pretrained(checkpoint,
+                                            device_map="auto",
+                                            load_in_8bit=True,
+                                            cache_dir='/HDD18TB/saranya/LLM_HF')
+
+model_name = 'bigcode/starcoder'
+is_shuffle = True
+
+train_dataset_path = input_file
+# eval_dataset_path = 'dataset/APPS/apps_processed_eval.csv' # not use
+input_column = 'description'
+output_column = 'test_case'
+output_dir = 'save/APPS/bigcode/starcoder'
+
+# gpu_num = '0'
+
+#########################
+model_name = model_name.lower()
+base_model = {
+    'pycoder': AutoModelForCausalLM,
+    'codegpt': AutoModelForCausalLM,
+    'transformers': GPT2Model,
+    'v': AutoModelForCausalLM,
+    'codet5-large': AutoModelForSeq2SeqLM,
+    'codet5-large': AutoModelForSeq2SeqLM,
+    'codet5-large': AutoModelForSeq2SeqLM,
+   
+}
+base_checkpoint = {
+    'pycoder': 'Wannita/PyCoder',
+    'codegpt': 'microsoft/CodeGPT-small-py',
+    'transformers': 'gpt2_no_pretrain_weight',
+    'gpt2': 'gpt2',
+    'codet5-large': 'Salesforce/codet5-large',
+    'codet5-large': 'Salesforce/codet5-large',
+    'codet5-large': 'Salesforce/codet5-large',
+    'unixcoder': 'microsoft/unixcoder-base',
+    'plbart': 'uclanlp/plbart-base',
+}
+# os.environ["CUDA_VISIBLE_DEVICES"] = gpu_num
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+# Set logging
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+log_file = output_dir + '/train.log'
+logger = logging.getLogger(__name__)
+logging.basicConfig(filename=log_file, filemode='a', format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+logger.addHandler(logging.StreamHandler())
+logger.info(f"Is CUDA available: {torch.cuda.is_available()}")
+logger.info(f"CUDA device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+device = "cuda" 
+
+# Initialize the tokenizer, model
+if model_name == 'transformers':
+    config = GPT2Config()
+    tokenizer = AutoTokenizer.from_pretrained('gpt2', truncation_side='left', do_lower_case=False)
+    tokenizer.pad_token = tokenizer.eos_token
+    model = base_model[model_name](config)
+elif model_name == 'unixcoder':
+    config =AutoConfig.from_pretrained(base_checkpoint[model_name])
+    config.is_decoder = True
+    tokenizer = AutoTokenizer.from_pretrained(base_checkpoint[model_name], truncation_side='left', do_lower_case=False)
+    encoder = RobertaModel.from_pretrained(base_checkpoint[model_name],config=config)
+    model=Seq2Seq(encoder=encoder,decoder=encoder,config=config,
+                  beam_size=5,max_length=512,
+                  sos_id=tokenizer.cls_token_id,eos_id=[tokenizer.sep_token_id])
+else:
+    tokenizer = None
+    if model_name == 'bigcode/starcoder':
+        tokenizer = RobertaTokenizer.from_pretrained(model_name)
+        tokenizer.padding_side = 'right'
+        tokenizer.model_max_length = 256
+        model = T5ForConditionalGeneration.from_pretrained(
+            model_name,
+        ).to('cuda')
+    
+logger.info('loaded model and tokenizer sucessfully.')
+
+# Load the CSV
+train_df = pd.read_csv(train_dataset_path, delimiter='\t', error_bad_lines=False, skip_blank_lines=True)
+
+# eval_df = pd.read_csv(eval_dataset_path)
+# print("null input:", len(train_df[input_column].dropna()))
+# print("null output:", len(train_df[output_column].dropna()))
+train_df, eval_df = train_test_split(train_df, test_size=0.1, random_state=42, shuffle=is_shuffle)
+
+# Convert the tokenized inputs and outputs into a PyTorch dataset
+class MyDataset(torch.utils.data.Dataset):
+    def __init__(self, inputs, outputs):
+        self.inputs = inputs
+        self.outputs = outputs
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": torch.tensor(self.inputs["input_ids"][idx]),
+            "attention_mask": torch.tensor(self.inputs["attention_mask"][idx]),
+            # "decoder_input_ids": torch.tensor(self.outputs["input_ids"][idx]),
+            # "decoder_attention_mask": torch.tensor(self.outputs["attention_mask"][idx]),
+            "labels": torch.tensor(self.outputs["input_ids"][idx]),
+        }
+
+    def __len__(self):
+        return len(self.inputs["input_ids"])
+
+# Tokenize the inputs and outputs
+# Convert the tokenized inputs and outputs into a PyTorch dataset
+print(train_df.columns)
+print(input_column)
+print(output_column)
+# Define the input column
+input_column = 'description'  # Replace with the actual column name
+
+# Tokenize the input
+train_inputs = tokenizer(list(train_df[input_column]), padding=True, truncation=True, max_length=512)
+train_outputs = tokenizer(list(train_df[output_column]), padding=True, truncation=True, max_length=512)
+train_dataset = MyDataset(train_inputs, train_outputs)
+
+eval_inputs = tokenizer(list(eval_df[input_column]), padding=True, truncation=True, max_length=512)
+eval_outputs = tokenizer(list(eval_df[output_column]), padding=True, truncation=True, max_length=512)
+eval_dataset = MyDataset(eval_inputs, eval_outputs)
+logger.info('loaded dataset sucessfully.')
+
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    learning_rate=2e-5, #1.5e-5,
+    weight_decay=0.01,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    gradient_accumulation_steps=4,
+    # predict_with_generate=True,
+    num_train_epochs=20,
+    logging_strategy="steps",
+    logging_steps=500,
+    save_strategy="epoch",
+    eval_accumulation_steps=1,
+    evaluation_strategy="epoch",
+    warmup_steps=1000,
+    fp16=True,
+    save_total_limit=10,
+    optim="adamw_torch",
+    lr_scheduler_type = "inverse_sqrt"
+)
+logger.info(f'''training_args: lr={training_args.learning_rate},
+            batch_size={training_args.per_device_train_batch_size},
+            epoch={training_args.num_train_epochs},
+            gradient_accumulation_steps={training_args.gradient_accumulation_steps},
+            warmup_steps={training_args.warmup_steps},
+            weight_decay={training_args.weight_decay},
+            optim={training_args.optim},
+            lr_scheduler_type={training_args.lr_scheduler_type},
+            fp16={training_args.fp16}
+            ''')
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=DataCollatorForSeq2Seq(tokenizer) if 'bigcode/starcoder' in model_name else DataCollatorForLanguageModeling(tokenizer, mlm=False),
+    tokenizer=tokenizer,
+)
+
+trainer.train()
+import pandas as pd
+import numpy as np
+import os
+import logging
+import torch
+import argparse
+from transformers import BloomTokenizerFast, get_scheduler
+# from unixcoder import UniXcoder
+from sklearn.model_selection import train_test_split
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, \
+                        GPT2Config, GPT2Model, RobertaModel, PLBartForCausalLM, \
+                        Trainer, TrainingArguments, \
+                        DataCollatorForSeq2Seq, DataCollatorForLanguageModeling
+
+from transformers import GPT2Tokenizer, GPT2Model
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2-large')
+model = GPT2Model.from_pretrained('gpt2-large')
+
+parser = argparse.ArgumentParser(description='Description of your script.')
+
+parser.add_argument('--input', '-i', type=str, help='The path to the TSV file.')
+args = parser.parse_args()
+
+input_file = args.input
+#########################
+######## config #########python finetuning_apps_code.py --input dataset.tsv
+# export CUDA_VISIBLE_DEVICES=0
+model_name = 'gpt2'
+is_shuffle = True
+
+train_dataset_path = input_file
+# eval_dataset_path = 'dataset/APPS/apps_processed_eval.csv' # not use
+input_column = 'description'
+output_column = 'test_case'
+output_dir = 'save/APPS/gpt2-large'
+
+gpu_num = '0'
+
+#########################
+model_name = model_name.lower()
+base_model = {
+    'pycoder': AutoModelForCausalLM,
+    'codegpt': AutoModelForCausalLM,
+    'transformers': GPT2Model,
+    'gpt2': AutoModelForCausalLM,
+    'plbart': PLBartForCausalLM,
+    'bloom' : AutoModelForCausalLM
+}
+base_checkpoint = {
+    'pycoder': 'Wannita/PyCoder',
+    'codegpt': 'microsoft/CodeGPT-small-py',
+    'transformers': 'gpt2_no_pretrain_weight',
+    'gpt2': 'gpt2',
+    'codet5-small': 'Salesforce/codet5-small',
+    'codet5-base': 'Salesforce/codet5-base',
+    'codet5-large': 'Salesforce/codet5-large',
+    'unixcoder': 'microsoft/unixcoder-base',
+    'plbart': 'uclanlp/plbart-base',
+}
+# os.environ["CUDA_VISIBLE_DEVICES"] = gpu_num
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+# Set logging
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+log_file = output_dir + '/train.log'
+logger = logging.getLogger(__name__)
+logging.basicConfig(filename=log_file, filemode='a', format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+logger.addHandler(logging.StreamHandler())
+logger.info(f"Is CUDA available: {torch.cuda.is_available()}")
+logger.info(f"CUDA device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+device = "cuda" 
+
+# Initialize the tokenizer, model
+if model_name == 'transformers':
+    config = GPT2Config()
+    tokenizer = AutoTokenizer.from_pretrained('gpt2', truncation_side='left', do_lower_case=False)
+    tokenizer.pad_token = tokenizer.eos_token
+    model = base_model[model_name](config)
+elif model_name == 'unixcoder':
+    config =AutoConfig.from_pretrained(base_checkpoint[model_name])
+    config.is_decoder = True
+    tokenizer = AutoTokenizer.from_pretrained(base_checkpoint[model_name], truncation_side='left', do_lower_case=False)
+    encoder = RobertaModel.from_pretrained(base_checkpoint[model_name],config=config)
+    model=Seq2Seq(encoder=encoder,decoder=encoder,config=config,
+                  beam_size=5,max_length=512,
+                  sos_id=tokenizer.cls_token_id,eos_id=[tokenizer.sep_token_id])
+else:
+    tokenizer = None
+    if model_name == 'bigscience/bloom-560m':
+        tokenizer = BloomTokenizerFast.from_pretrained(model_name)
+        tokenizer.padding_side = 'right'
+        tokenizer.model_max_length = 256
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+        ).to('cuda')
+    if model_name == 'gpt2':
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer.pad_token = tokenizer.eos_token  # Set the padding token to the EOS token
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+        ).to('cuda')
+    if model_name == 'plbart':
+        model = base_model[model_name].from_pretrained(base_checkpoint[model_name], add_cross_attention=False)
+        assert model.config.is_decoder, f"{model.__class__} has to be configured as a decoder."
+    
+logger.info('loaded model and tokenizer sucessfully.')
+
+# Load the CSV
+train_df = pd.read_csv(train_dataset_path,delimiter='\t')
+# eval_df = pd.read_csv(eval_dataset_path)
+# print("null input:", len(train_df[input_column].dropna()))
+# print("null output:", len(train_df[output_column].dropna()))
+train_df, eval_df = train_test_split(train_df, test_size=0.1, random_state=42, shuffle=is_shuffle)
+
+# Convert the tokenized inputs and outputs into a PyTorch dataset
+class MyDataset(torch.utils.data.Dataset):
+    def __init__(self, inputs, outputs):
+        self.inputs = inputs
+        self.outputs = outputs
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": torch.tensor(self.inputs["input_ids"][idx]),
+            "attention_mask": torch.tensor(self.inputs["attention_mask"][idx]),
+            # "decoder_input_ids": torch.tensor(self.outputs["input_ids"][idx]),
+            # "decoder_attention_mask": torch.tensor(self.outputs["attention_mask"][idx]),
+            "labels": torch.tensor(self.outputs["input_ids"][idx]),
+        }
+
+    def __len__(self):
+        return len(self.inputs["input_ids"])
+
+# Tokenize the inputs and outputs
+# Convert the tokenized inputs and outputs into a PyTorch dataset
+train_inputs = tokenizer(list(train_df[input_column]), padding=True, truncation=True, max_length=512)
+train_outputs = tokenizer(list(train_df[output_column]), padding=True, truncation=True, max_length=512)
+train_dataset = MyDataset(train_inputs, train_outputs)
+
+eval_inputs = tokenizer(list(eval_df[input_column]), padding=True, truncation=True, max_length=512)
+eval_outputs = tokenizer(list(eval_df[output_column]), padding=True, truncation=True, max_length=512)
+eval_dataset = MyDataset(eval_inputs, eval_outputs)
+logger.info('loaded dataset sucessfully.')
+
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    learning_rate=2e-5, #1.5e-5,
+    weight_decay=0.01,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    gradient_accumulation_steps=4,
+    # predict_with_generate=True,
+    num_train_epochs=20,
+    logging_strategy="steps",
+    logging_steps=500,
+    save_strategy="epoch",
+    eval_accumulation_steps=1,
+    evaluation_strategy="epoch",
+    warmup_steps=1000,
+    fp16=True,
+    save_total_limit=10,
+    optim="adamw_torch",
+    lr_scheduler_type = "inverse_sqrt"
+)
+logger.info(f'''training_args: lr={training_args.learning_rate},
+            batch_size={training_args.per_device_train_batch_size},
+            epoch={training_args.num_train_epochs},
+            gradient_accumulation_steps={training_args.gradient_accumulation_steps},
+            warmup_steps={training_args.warmup_steps},
+            weight_decay={training_args.weight_decay},
+            optim={training_args.optim},
+            lr_scheduler_type={training_args.lr_scheduler_type},
+            fp16={training_args.fp16}
+            ''')
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    data_collator=DataCollatorForSeq2Seq(tokenizer) if 'gpt2' in model_name else DataCollatorForLanguageModeling(tokenizer, mlm=False),
+    tokenizer=tokenizer,
+)
+
+trainer.train()
+import os
+import csv
+from transformers import T5ForConditionalGeneration, RobertaTokenizer
+import argparse
+from transformers import BloomTokenizerFast, get_scheduler
+# from unixcoder import UniXcoder
+from sklearn.model_selection import train_test_split
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, \
+                        GPT2Config, GPT2Model, RobertaModel, PLBartForCausalLM, \
+                        Trainer, TrainingArguments, \
+                        DataCollatorForSeq2Seq, DataCollatorForLanguageModeling
+
+model_name = "bigscience/bloom-560m"
+model = AutoModelForCausalLM.from_pretrained(model_name)
+tokenizer = BloomTokenizerFast.from_pretrained(model_name)
+
+# Specify the input folder containing multiple subfolders with CSV files
+input_folder = "/home/saranya/HDD18TB/LLM/LLM-for-Test-Case-Generation/Evaluation_NoFineTuned_Prompts/Csv"  # Replace with the actual path to your input folder
+
+# Specify the output folder for the generated text files
+output_folder = "/home/saranya/HDD18TB/LLM/LLM-for-Test-Case-Generation/Output/Evaluation_NoFineTuned_Prompts/Bloom/Csv"  # Replace with the desired output folder path
+os.makedirs(output_folder, exist_ok=True)
+
+# Function to generate JUnit test cases and write to a text file
+def generate_and_write_tests(csv_file_path, input_folder, output_folder):
+    relative_path = os.path.relpath(csv_file_path, input_folder)
+    output_path = os.path.join(output_folder, relative_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    method_descriptions = []
+    with open(csv_file_path, 'r') as csvfile:
+        reader = csv.reader(csvfile)
+        for row in reader:
+            if row:  # Check if the row is not empty
+                method_descriptions.append(row[0])
+
+    # output_file_path = os.path.join(output_path, f"{os.path.basename(csv_file_path)[:-4]}Test.txt")
+    output_file_path = os.path.splitext(output_path)[0] + '.txt'
+    # Ensure the directory structure exists
+    os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+    
+    with open(output_file_path, 'w') as output_file:
+        for method_description in method_descriptions:
+            generated_code = model.generate(
+                tokenizer.encode(method_description, return_tensors="pt"),
+                max_length=1024,
+                num_return_sequences=1,
+                no_repeat_ngram_size=2,
+                top_k=50,
+                top_p=0.95,
+                temperature=0.95,
+            )
+
+            generated_code = tokenizer.decode(generated_code[0], skip_special_tokens=True)
+            output_file.write(f"Generated JUnit Test Case: {generated_code}\n\n")
+
+    
+
+# Iterate over CSV files in the input folder and its subfolders
+for root, dirs, files in os.walk(input_folder):
+    for file in files:
+        if file.endswith('.csv'):
+            csv_file_path = os.path.join(root, file)
+            generate_and_write_tests(csv_file_path, input_folder, output_folder)
+
+import pandas as pd
+import os
+import pickle
+import json
+import openai
+import time
+from tenacity import retry, stop_after_attempt, wait_random_exponential
+
+# Define the folder containing CSV files
+folder_path = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Dataset/Evaluation_Dataset/Evaluation_NoFineTuned_Prompts/Lang/Lang_folder_6'
+
+# Define the output folder for text files
+output_folder = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Output/Evaluation_NoFineTuned_Prompts/GPT3.5/Lang'
+
+# Reading API keys
+api_key = json.load(open('access_token.json'))
+key = api_key['openai_access_token']
+
+@retry(wait=wait_random_exponential(min=0.3, max=2), stop=stop_after_attempt(6))
+def completion_with_backoff(**kwargs):
+    return openai.ChatCompletion.create(**kwargs)
+
+openai.api_key = key
+
+# Get a list of CSV files in the folder
+csv_files = [f for f in os.listdir(folder_path) if f.endswith('.csv')]
+
+for csv_file in csv_files:
+    # Read the CSV file
+    df_test = pd.read_csv(os.path.join(folder_path, csv_file), delimiter='\t')
+
+    # Define the output text file name
+    output_filename = os.path.splitext(csv_file)[0] + '.txt'
+    output_file_path = os.path.join(output_folder, output_filename)
+
+    openai_completions = []
+
+    input_column = 'description'
+    # Open the output text file for writing
+    with open(output_file_path, "a") as file:
+        for i in range(len(df_test)):
+            description_content = str(df_test[input_column][i])
+            completion = completion_with_backoff(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "user", "content": description_content}
+                ],
+                max_tokens=300
+            )
+            openai_completions.append(completion)
+            save_obj = {'idx': i, 'response': completion}
+            json_str = json.dumps(save_obj)
+            file.write(json_str + '\n')
+            time.sleep(10)
+
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "bd760cfc",
+   "metadata": {},
+   "source": [
+    "# Step 1 "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "id": "c6320b18",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "WARNING:tensorflow:From C:\\Users\\NTC\\anaconda3\\Lib\\site-packages\\keras\\src\\losses.py:2976: The name tf.losses.sparse_softmax_cross_entropy is deprecated. Please use tf.compat.v1.losses.sparse_softmax_cross_entropy instead.\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "C:\\Users\\NTC\\anaconda3\\Lib\\site-packages\\transformers\\utils\\generic.py:260: UserWarning: torch.utils._pytree._register_pytree_node is deprecated. Please use torch.utils._pytree.register_pytree_node instead.\n",
+      "  torch.utils._pytree._register_pytree_node(\n",
+      "C:\\Users\\NTC\\anaconda3\\Lib\\site-packages\\transformers\\utils\\generic.py:260: UserWarning: torch.utils._pytree._register_pytree_node is deprecated. Please use torch.utils._pytree.register_pytree_node instead.\n",
+      "  torch.utils._pytree._register_pytree_node(\n"
+     ]
+    }
+   ],
+   "source": [
+    "import pandas as pd\n",
+    "import numpy as np\n",
+    "import os\n",
+    "import logging\n",
+    "import torch\n",
+    "import argparse\n",
+    "from transformers import RobertaTokenizer, get_scheduler\n",
+    "from sklearn.model_selection import train_test_split\n",
+    "from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, \\\n",
+    "                        GPT2Config, GPT2Model, RobertaModel, PLBartForCausalLM, \\\n",
+    "                        Trainer, TrainingArguments, \\\n",
+    "                        DataCollatorForSeq2Seq, DataCollatorForLanguageModeling, T5ForConditionalGeneration\n",
+    "from transformers import T5Tokenizer"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "1d580339",
+   "metadata": {},
+   "source": [
+    "---------------------------------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "bd1c9584",
+   "metadata": {},
+   "source": [
+    "# Step 2"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "id": "b8a47377",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "You are using the default legacy behaviour of the <class 'transformers.models.t5.tokenization_t5.T5Tokenizer'>. If you see this, DO NOT PANIC! This is expected, and simply means that the `legacy` (previous) behavior will be used so nothing changes for you. If you want to use the new behaviour, set `legacy=True`. This should only be set if you understand what it means, and thouroughly read the reason why this was added as explained in https://github.com/huggingface/transformers/pull/24565\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Input file: Users\\NTC\\Desktop\\mine\\GRA\\LLMforTDD-main\\LLMforTDD-main\\Training Dataset\\Repos\\Repos\n"
+     ]
+    }
+   ],
+   "source": [
+    "import argparse\n",
+    "from transformers import T5Tokenizer\n",
+    "import sys\n",
+    "\n",
+    "tokenizer = T5Tokenizer.from_pretrained(\"t5-small\")\n",
+    "\n",
+    "def main(input_file):\n",
+    "    print(f\"Input file: {input_file}\")\n",
+    "\n",
+    "if __name__ == \"__main__\":\n",
+    "\n",
+    "    if \"ipykernel\" in sys.modules:\n",
+    "\n",
+    "        input_file = r'Users\\NTC\\Desktop\\mine\\GRA\\LLMforTDD-main\\LLMforTDD-main\\Training Dataset\\Repos\\Repos'\n",
+    "    else:\n",
+    "\n",
+    "        parser = argparse.ArgumentParser(description='Description of your script.')\n",
+    "        parser.add_argument('--input', '-i', type=str, help='The path to the TSV file.')\n",
+    "        args = parser.parse_args()\n",
+    "        input_file = args.input\n",
+    "    \n",
+    "    main(input_file)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "dc91ace0",
+   "metadata": {},
+   "source": [
+    "---------------------------------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "dbc6ce0f",
+   "metadata": {},
+   "source": [
+    "# Step 3"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 41,
+   "id": "6f64801d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model_name = 'codet5-large'\n",
+    "is_shuffle = True\n",
+    "\n",
+    "train_dataset_path = input_file\n",
+    "input_column = 'fork_count'\n",
+    "output_column = 'test_case'\n",
+    "output_dir = 'save/APPS/codet5-code-v2'"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "46f29e90",
+   "metadata": {},
+   "source": [
+    "---------------------------------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "d4d634dd",
+   "metadata": {},
+   "source": [
+    "# Step 4"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "id": "34942c07",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "model_name = model_name.lower()\n",
+    "base_model = {\n",
+    "    'pycoder': AutoModelForCausalLM,\n",
+    "    'codegpt': AutoModelForCausalLM,\n",
+    "    'transformers': GPT2Model,\n",
+    "    'gpt2': AutoModelForCausalLM,\n",
+    "    'codet5-large': AutoModelForSeq2SeqLM,\n",
+    "    'codet5-large': AutoModelForSeq2SeqLM,\n",
+    "    'codet5-large': AutoModelForSeq2SeqLM,\n",
+    "   \n",
+    "}\n",
+    "base_checkpoint = {\n",
+    "    'pycoder': 'Wannita/PyCoder',\n",
+    "    'codegpt': 'microsoft/CodeGPT-small-py',\n",
+    "    'transformers': 'gpt2_no_pretrain_weight',\n",
+    "    'gpt2': 'gpt2',\n",
+    "    'codet5-large': 'Salesforce/codet5-large',\n",
+    "    'codet5-large': 'Salesforce/codet5-large',\n",
+    "    'codet5-large': 'Salesforce/codet5-large',\n",
+    "    'unixcoder': 'microsoft/unixcoder-base',\n",
+    "    'plbart': 'uclanlp/plbart-base',\n",
+    "}"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "7560de47",
+   "metadata": {},
+   "source": [
+    "---------------------------------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "470dfc8c",
+   "metadata": {},
+   "source": [
+    "# Step 5"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "id": "1d13afd9",
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Is CUDA available: False\n"
+     ]
+    },
+    {
+     "ename": "AssertionError",
+     "evalue": "Torch not compiled with CUDA enabled",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[1;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[1;31mAssertionError\u001b[0m                            Traceback (most recent call last)",
+      "Cell \u001b[1;32mIn[18], line 11\u001b[0m\n\u001b[0;32m      9\u001b[0m logger\u001b[38;5;241m.\u001b[39maddHandler(logging\u001b[38;5;241m.\u001b[39mStreamHandler())\n\u001b[0;32m     10\u001b[0m logger\u001b[38;5;241m.\u001b[39minfo(\u001b[38;5;124mf\u001b[39m\u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mIs CUDA available: \u001b[39m\u001b[38;5;132;01m{\u001b[39;00mtorch\u001b[38;5;241m.\u001b[39mcuda\u001b[38;5;241m.\u001b[39mis_available()\u001b[38;5;132;01m}\u001b[39;00m\u001b[38;5;124m\"\u001b[39m)\n\u001b[1;32m---> 11\u001b[0m logger\u001b[38;5;241m.\u001b[39minfo(\u001b[38;5;124mf\u001b[39m\u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mCUDA device: \u001b[39m\u001b[38;5;132;01m{\u001b[39;00mtorch\u001b[38;5;241m.\u001b[39mcuda\u001b[38;5;241m.\u001b[39mget_device_name(torch\u001b[38;5;241m.\u001b[39mcuda\u001b[38;5;241m.\u001b[39mcurrent_device())\u001b[38;5;132;01m}\u001b[39;00m\u001b[38;5;124m\"\u001b[39m)\n\u001b[0;32m     12\u001b[0m device \u001b[38;5;241m=\u001b[39m \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mcuda\u001b[39m\u001b[38;5;124m\"\u001b[39m\n",
+      "File \u001b[1;32m~\\anaconda3\\Lib\\site-packages\\torch\\cuda\\__init__.py:787\u001b[0m, in \u001b[0;36mcurrent_device\u001b[1;34m()\u001b[0m\n\u001b[0;32m    785\u001b[0m \u001b[38;5;28;01mdef\u001b[39;00m \u001b[38;5;21mcurrent_device\u001b[39m() \u001b[38;5;241m-\u001b[39m\u001b[38;5;241m>\u001b[39m \u001b[38;5;28mint\u001b[39m:\n\u001b[0;32m    786\u001b[0m \u001b[38;5;250m    \u001b[39m\u001b[38;5;124mr\u001b[39m\u001b[38;5;124;03m\"\"\"Return the index of a currently selected device.\"\"\"\u001b[39;00m\n\u001b[1;32m--> 787\u001b[0m     _lazy_init()\n\u001b[0;32m    788\u001b[0m     \u001b[38;5;28;01mreturn\u001b[39;00m torch\u001b[38;5;241m.\u001b[39m_C\u001b[38;5;241m.\u001b[39m_cuda_getDevice()\n",
+      "File \u001b[1;32m~\\anaconda3\\Lib\\site-packages\\torch\\cuda\\__init__.py:293\u001b[0m, in \u001b[0;36m_lazy_init\u001b[1;34m()\u001b[0m\n\u001b[0;32m    288\u001b[0m     \u001b[38;5;28;01mraise\u001b[39;00m \u001b[38;5;167;01mRuntimeError\u001b[39;00m(\n\u001b[0;32m    289\u001b[0m         \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mCannot re-initialize CUDA in forked subprocess. To use CUDA with \u001b[39m\u001b[38;5;124m\"\u001b[39m\n\u001b[0;32m    290\u001b[0m         \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mmultiprocessing, you must use the \u001b[39m\u001b[38;5;124m'\u001b[39m\u001b[38;5;124mspawn\u001b[39m\u001b[38;5;124m'\u001b[39m\u001b[38;5;124m start method\u001b[39m\u001b[38;5;124m\"\u001b[39m\n\u001b[0;32m    291\u001b[0m     )\n\u001b[0;32m    292\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;129;01mnot\u001b[39;00m \u001b[38;5;28mhasattr\u001b[39m(torch\u001b[38;5;241m.\u001b[39m_C, \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124m_cuda_getDeviceCount\u001b[39m\u001b[38;5;124m\"\u001b[39m):\n\u001b[1;32m--> 293\u001b[0m     \u001b[38;5;28;01mraise\u001b[39;00m \u001b[38;5;167;01mAssertionError\u001b[39;00m(\u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mTorch not compiled with CUDA enabled\u001b[39m\u001b[38;5;124m\"\u001b[39m)\n\u001b[0;32m    294\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m _cudart \u001b[38;5;129;01mis\u001b[39;00m \u001b[38;5;28;01mNone\u001b[39;00m:\n\u001b[0;32m    295\u001b[0m     \u001b[38;5;28;01mraise\u001b[39;00m \u001b[38;5;167;01mAssertionError\u001b[39;00m(\n\u001b[0;32m    296\u001b[0m         \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mlibcudart functions unavailable. It looks like you have a broken build?\u001b[39m\u001b[38;5;124m\"\u001b[39m\n\u001b[0;32m    297\u001b[0m     )\n",
+      "\u001b[1;31mAssertionError\u001b[0m: Torch not compiled with CUDA enabled"
+     ]
+    }
+   ],
+   "source": [
+    "os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'\n",
+    "os.environ[\"TOKENIZERS_PARALLELISM\"] = \"true\"\n",
+    "\n",
+    "if not os.path.exists(output_dir):\n",
+    "    os.makedirs(output_dir)\n",
+    "log_file = output_dir + '/train.log'\n",
+    "logger = logging.getLogger(__name__)\n",
+    "logging.basicConfig(filename=log_file, filemode='a', format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)\n",
+    "logger.addHandler(logging.StreamHandler())\n",
+    "logger.info(f\"Is CUDA available: {torch.cuda.is_available()}\")\n",
+    "logger.info(f\"CUDA device: {torch.cuda.get_device_name(torch.cuda.current_device())}\")\n",
+    "device = \"cuda\" "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "b7d1c4aa",
+   "metadata": {},
+   "source": [
+    "---------------------------------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "617c698a",
+   "metadata": {},
+   "source": [
+    "# Step 6"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "id": "8f9841a3",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "loaded model and tokenizer sucessfully.\n"
+     ]
+    }
+   ],
+   "source": [
+    "if model_name == 'transformers':\n",
+    "    config = GPT2Config()\n",
+    "    tokenizer = AutoTokenizer.from_pretrained('gpt2', truncation_side='left', do_lower_case=False)\n",
+    "    tokenizer.pad_token = tokenizer.eos_token\n",
+    "    model = base_model[model_name](config)\n",
+    "elif model_name == 'unixcoder':\n",
+    "    config =AutoConfig.from_pretrained(base_checkpoint[model_name])\n",
+    "    config.is_decoder = True\n",
+    "    tokenizer = AutoTokenizer.from_pretrained(base_checkpoint[model_name], truncation_side='left', do_lower_case=False)\n",
+    "    encoder = RobertaModel.from_pretrained(base_checkpoint[model_name],config=config)\n",
+    "    model=Seq2Seq(encoder=encoder,decoder=encoder,config=config,\n",
+    "                  beam_size=5,max_length=512,\n",
+    "                  sos_id=tokenizer.cls_token_id,eos_id=[tokenizer.sep_token_id])\n",
+    "else:\n",
+    "    tokenizer = None\n",
+    "    if model_name == 'Salesforce/codet5-large':\n",
+    "        tokenizer = RobertaTokenizer.from_pretrained(model_name)\n",
+    "        tokenizer.padding_side = 'right'\n",
+    "        tokenizer.model_max_length = 256\n",
+    "        model = T5ForConditionalGeneration.from_pretrained(\n",
+    "            model_name,\n",
+    "        ).to('cuda')\n",
+    "    \n",
+    "logger.info('loaded model and tokenizer sucessfully.')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "499c8450",
+   "metadata": {},
+   "source": [
+    "---------------------------------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "4213776e",
+   "metadata": {},
+   "source": [
+    "# Step 7"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "id": "d73296d6",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "import pandas as pd \n",
+    "train_df = pd.read_json('train.json')\n",
+    "\n",
+    "# eval_df = pd.read_csv(eval_dataset_path)\n",
+    "# print(\"null input:\", len(train_df[input_column].dropna()))\n",
+    "# print(\"null output:\", len(train_df[output_column].dropna()))\n",
+    "train_df, eval_df = train_test_split(train_df, test_size=0.1, random_state=42, shuffle=is_shuffle)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "9bfcaa54",
+   "metadata": {},
+   "source": [
+    "---------------------------------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "08e829c0",
+   "metadata": {},
+   "source": [
+    "# Step 8"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "id": "947bd9d8",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class MyDataset(torch.utils.data.Dataset):\n",
+    "    def __init__(self, inputs, outputs):\n",
+    "        self.inputs = inputs\n",
+    "        self.outputs = outputs\n",
+    "\n",
+    "    def __getitem__(self, idx):\n",
+    "        return {\n",
+    "            \"input_ids\": torch.tensor(self.inputs[\"input_ids\"][idx]),\n",
+    "            \"attention_mask\": torch.tensor(self.inputs[\"attention_mask\"][idx]),\n",
+    "            \"decoder_input_ids\": torch.tensor(self.outputs[\"input_ids\"][idx]),\n",
+    "            \"decoder_attention_mask\": torch.tensor(self.outputs[\"attention_mask\"][idx]),\n",
+    "            \"labels\": torch.tensor(self.outputs[\"input_ids\"][idx]),\n",
+    "        }\n",
+    "\n",
+    "    def __len__(self):\n",
+    "        return len(self.inputs[\"input_ids\"])\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "b0cd6e45",
+   "metadata": {},
+   "source": [
+    "---------------------------------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "711c0fc0",
+   "metadata": {},
+   "source": [
+    "# Step 9"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 45,
+   "id": "9a602b59",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Index(['repo_id', 'url', 'language', 'is_fork', 'fork_count',\n",
+      "       'stargazer_count', 'size', 'license', 'num_instances', 'stars',\n",
+      "       'created', 'updates', 'fork'],\n",
+      "      dtype='object')\n",
+      "fork_count\n",
+      "output\n"
+     ]
+    }
+   ],
+   "source": [
+    "print(train_df.columns)\n",
+    "print(input_column)\n",
+    "print(output_column)\n",
+    "input_column = 'description'"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "6b5f3c11",
+   "metadata": {},
+   "source": [
+    "---------------------------------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cd678710",
+   "metadata": {},
+   "source": [
+    "# Step 10"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "63b3c0e2",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "WARNING:tensorflow:From C:\\Users\\NTC\\anaconda3\\Lib\\site-packages\\keras\\src\\losses.py:2976: The name tf.losses.sparse_softmax_cross_entropy is deprecated. Please use tf.compat.v1.losses.sparse_softmax_cross_entropy instead.\n",
+      "\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "C:\\Users\\NTC\\anaconda3\\Lib\\site-packages\\transformers\\utils\\generic.py:260: UserWarning: torch.utils._pytree._register_pytree_node is deprecated. Please use torch.utils._pytree.register_pytree_node instead.\n",
+      "  torch.utils._pytree._register_pytree_node(\n",
+      "Is CUDA available: False\n"
+     ]
+    },
+    {
+     "ename": "AssertionError",
+     "evalue": "Torch not compiled with CUDA enabled",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[1;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[1;31mAssertionError\u001b[0m                            Traceback (most recent call last)",
+      "Cell \u001b[1;32mIn[1], line 29\u001b[0m\n\u001b[0;32m     27\u001b[0m logger\u001b[38;5;241m.\u001b[39maddHandler(logging\u001b[38;5;241m.\u001b[39mStreamHandler())\n\u001b[0;32m     28\u001b[0m logger\u001b[38;5;241m.\u001b[39minfo(\u001b[38;5;124mf\u001b[39m\u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mIs CUDA available: \u001b[39m\u001b[38;5;132;01m{\u001b[39;00mtorch\u001b[38;5;241m.\u001b[39mcuda\u001b[38;5;241m.\u001b[39mis_available()\u001b[38;5;132;01m}\u001b[39;00m\u001b[38;5;124m\"\u001b[39m)\n\u001b[1;32m---> 29\u001b[0m logger\u001b[38;5;241m.\u001b[39minfo(\u001b[38;5;124mf\u001b[39m\u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mCUDA device: \u001b[39m\u001b[38;5;132;01m{\u001b[39;00mtorch\u001b[38;5;241m.\u001b[39mcuda\u001b[38;5;241m.\u001b[39mget_device_name(torch\u001b[38;5;241m.\u001b[39mcuda\u001b[38;5;241m.\u001b[39mcurrent_device())\u001b[38;5;132;01m}\u001b[39;00m\u001b[38;5;124m\"\u001b[39m)\n\u001b[0;32m     30\u001b[0m device \u001b[38;5;241m=\u001b[39m \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mcuda\u001b[39m\u001b[38;5;124m\"\u001b[39m\n\u001b[0;32m     32\u001b[0m \u001b[38;5;66;03m# Load the JSON file\u001b[39;00m\n",
+      "File \u001b[1;32m~\\anaconda3\\Lib\\site-packages\\torch\\cuda\\__init__.py:787\u001b[0m, in \u001b[0;36mcurrent_device\u001b[1;34m()\u001b[0m\n\u001b[0;32m    785\u001b[0m \u001b[38;5;28;01mdef\u001b[39;00m \u001b[38;5;21mcurrent_device\u001b[39m() \u001b[38;5;241m-\u001b[39m\u001b[38;5;241m>\u001b[39m \u001b[38;5;28mint\u001b[39m:\n\u001b[0;32m    786\u001b[0m \u001b[38;5;250m    \u001b[39m\u001b[38;5;124mr\u001b[39m\u001b[38;5;124;03m\"\"\"Return the index of a currently selected device.\"\"\"\u001b[39;00m\n\u001b[1;32m--> 787\u001b[0m     _lazy_init()\n\u001b[0;32m    788\u001b[0m     \u001b[38;5;28;01mreturn\u001b[39;00m torch\u001b[38;5;241m.\u001b[39m_C\u001b[38;5;241m.\u001b[39m_cuda_getDevice()\n",
+      "File \u001b[1;32m~\\anaconda3\\Lib\\site-packages\\torch\\cuda\\__init__.py:293\u001b[0m, in \u001b[0;36m_lazy_init\u001b[1;34m()\u001b[0m\n\u001b[0;32m    288\u001b[0m     \u001b[38;5;28;01mraise\u001b[39;00m \u001b[38;5;167;01mRuntimeError\u001b[39;00m(\n\u001b[0;32m    289\u001b[0m         \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mCannot re-initialize CUDA in forked subprocess. To use CUDA with \u001b[39m\u001b[38;5;124m\"\u001b[39m\n\u001b[0;32m    290\u001b[0m         \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mmultiprocessing, you must use the \u001b[39m\u001b[38;5;124m'\u001b[39m\u001b[38;5;124mspawn\u001b[39m\u001b[38;5;124m'\u001b[39m\u001b[38;5;124m start method\u001b[39m\u001b[38;5;124m\"\u001b[39m\n\u001b[0;32m    291\u001b[0m     )\n\u001b[0;32m    292\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;129;01mnot\u001b[39;00m \u001b[38;5;28mhasattr\u001b[39m(torch\u001b[38;5;241m.\u001b[39m_C, \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124m_cuda_getDeviceCount\u001b[39m\u001b[38;5;124m\"\u001b[39m):\n\u001b[1;32m--> 293\u001b[0m     \u001b[38;5;28;01mraise\u001b[39;00m \u001b[38;5;167;01mAssertionError\u001b[39;00m(\u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mTorch not compiled with CUDA enabled\u001b[39m\u001b[38;5;124m\"\u001b[39m)\n\u001b[0;32m    294\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m _cudart \u001b[38;5;129;01mis\u001b[39;00m \u001b[38;5;28;01mNone\u001b[39;00m:\n\u001b[0;32m    295\u001b[0m     \u001b[38;5;28;01mraise\u001b[39;00m \u001b[38;5;167;01mAssertionError\u001b[39;00m(\n\u001b[0;32m    296\u001b[0m         \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mlibcudart functions unavailable. It looks like you have a broken build?\u001b[39m\u001b[38;5;124m\"\u001b[39m\n\u001b[0;32m    297\u001b[0m     )\n",
+      "\u001b[1;31mAssertionError\u001b[0m: Torch not compiled with CUDA enabled"
+     ]
+    }
+   ],
+   "source": [
+    "import pandas as pd\n",
+    "from sklearn.model_selection import train_test_split\n",
+    "from transformers import Trainer, TrainingArguments, DataCollatorForSeq2Seq, DataCollatorForLanguageModeling\n",
+    "import torch\n",
+    "import os\n",
+    "import logging\n",
+    "\n",
+    "# Set environment variables to suppress warnings\n",
+    "os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'\n",
+    "os.environ[\"TOKENIZERS_PARALLELISM\"] = \"true\"\n",
+    "\n",
+    "# Define file paths and column names\n",
+    "train_dataset_path = 'C:\\\\Users\\\\NTC\\\\Desktop\\\\mine\\\\GRA\\\\LLMforTDD-main\\\\LLMforTDD-main\\\\train.json'\n",
+    "output_dir = './output'\n",
+    "input_column = 'fork_count'  # Replace with your actual input column name\n",
+    "output_column = 'output'      # Replace with your actual output column name\n",
+    "is_shuffle = True\n",
+    "\n",
+    "# Create output directory if it doesn't exist\n",
+    "if not os.path.exists(output_dir):\n",
+    "    os.makedirs(output_dir)\n",
+    "\n",
+    "# Setup logging\n",
+    "log_file = output_dir + '/train.log'\n",
+    "logger = logging.getLogger(__name__)\n",
+    "logging.basicConfig(filename=log_file, filemode='a', format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)\n",
+    "logger.addHandler(logging.StreamHandler())\n",
+    "logger.info(f\"Is CUDA available: {torch.cuda.is_available()}\")\n",
+    "logger.info(f\"CUDA device: {torch.cuda.get_device_name(torch.cuda.current_device())}\")\n",
+    "device = \"cuda\"\n",
+    "\n",
+    "# Load the JSON file\n",
+    "train_df = pd.read_json(train_dataset_path)\n",
+    "\n",
+    "# Check and print column names to verify\n",
+    "logger.info(f\"Column names in the dataset: {train_df.columns}\")\n",
+    "\n",
+    "# Ensure the column names are correct\n",
+    "if input_column not in train_df.columns or output_column not in train_df.columns:\n",
+    "    raise ValueError(f\"Column names '{input_column}' or '{output_column}' not found in the dataset.\")\n",
+    "\n",
+    "# Split the dataset into training and evaluation sets\n",
+    "train_df, eval_df = train_test_split(train_df, test_size=0.1, random_state=42, shuffle=is_shuffle)\n",
+    "\n",
+    "# Tokenize the inputs and outputs\n",
+    "train_inputs = tokenizer(list(train_df[input_column]), padding=True, truncation=True, max_length=512)\n",
+    "train_outputs = tokenizer(list(train_df[output_column]), padding=True, truncation=True, max_length=512)\n",
+    "train_dataset = MyDataset(train_inputs, train_outputs)\n",
+    "\n",
+    "eval_inputs = tokenizer(list(eval_df[input_column]), padding=True, truncation=True, max_length=512)\n",
+    "eval_outputs = tokenizer(list(eval_df[output_column]), padding=True, truncation=True, max_length=512)\n",
+    "eval_dataset = MyDataset(eval_inputs, eval_outputs)\n",
+    "logger.info('Loaded dataset successfully.')\n",
+    "\n",
+    "# Define training arguments\n",
+    "training_args = TrainingArguments(\n",
+    "    output_dir=output_dir,\n",
+    "    learning_rate=2e-5,\n",
+    "    weight_decay=0.01,\n",
+    "    per_device_train_batch_size=2,\n",
+    "    per_device_eval_batch_size=2,\n",
+    "    gradient_accumulation_steps=4,\n",
+    "    num_train_epochs=20,\n",
+    "    logging_strategy=\"steps\",\n",
+    "    logging_steps=500,\n",
+    "    save_strategy=\"epoch\",\n",
+    "    eval_accumulation_steps=1,\n",
+    "    evaluation_strategy=\"epoch\",\n",
+    "    warmup_steps=1000,\n",
+    "    fp16=True,\n",
+    "    save_total_limit=10,\n",
+    "    optim=\"adamw_torch\",\n",
+    "    lr_scheduler_type=\"inverse_sqrt\"\n",
+    ")\n",
+    "logger.info(f'''Training arguments: lr={training_args.learning_rate},\n",
+    "            batch_size={training_args.per_device_train_batch_size},\n",
+    "            epoch={training_args.num_train_epochs},\n",
+    "            gradient_accumulation_steps={training_args.gradient_accumulation_steps},\n",
+    "            warmup_steps={training_args.warmup_steps},\n",
+    "            weight_decay={training_args.weight_decay},\n",
+    "            optim={training_args.optim},\n",
+    "            lr_scheduler_type={training_args.lr_scheduler_type},\n",
+    "            fp16={training_args.fp16}\n",
+    "            ''')\n",
+    "\n",
+    "# Initialize the Trainer\n",
+    "trainer = Trainer(\n",
+    "    model=model,\n",
+    "    args=training_args,\n",
+    "    train_dataset=train_dataset,\n",
+    "    eval_dataset=eval_dataset,\n",
+    "    data_collator=DataCollatorForSeq2Seq(tokenizer) if 'codet5' in model_name else DataCollatorForLanguageModeling(tokenizer, mlm=False),\n",
+    "    tokenizer=tokenizer,\n",
+    ")\n",
+    "\n",
+    "# Start training\n",
+    "trainer.train()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "4068e596",
+   "metadata": {},
+   "source": [
+    "---------------------------------------------------"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "17dfd336",
+   "metadata": {},
+   "source": [
+    "# Step 1"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "12d271f6",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "WARNING:tensorflow:From C:\\Users\\NTC\\anaconda3\\Lib\\site-packages\\keras\\src\\losses.py:2976: The name tf.losses.sparse_softmax_cross_entropy is deprecated. Please use tf.compat.v1.losses.sparse_softmax_cross_entropy instead.\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "import os\n",
+    "import torch\n",
+    "import glob\n",
+    "import datasets\n",
+    "import pickle\n",
+    "import pandas as pd\n",
+    "from tqdm import tqdm\n",
+    "from torch.utils.data import DataLoader\n",
+    "from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling, AutoModelForSeq2SeqLM, DataCollatorForSeq2Seq"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "a3826942",
+   "metadata": {},
+   "source": [
+    "---------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "306f49c9",
+   "metadata": {},
+   "source": [
+    "# Step 2"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "id": "72056bfd",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model_name = 'Salesforce/codet5-large'\n",
+    "model_dir  = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/save/APPS/codet5-code-v2/checkpoint-183520'\n",
+    "test_dataset_folder = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Dataset/Test'\n",
+    "input_column = 'fork_count' \n",
+    "output_column = 'test_case'\n",
+    "processed = False\n",
+    "\n",
+    "output_dir = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Output/Sample'\n",
+    "output_suffix = 'Test'\n",
+    "\n",
+    "batch_size = 4\n",
+    "beam_size = 4\n",
+    "max_new_tokens = 500\n",
+    "max_length = 1024\n",
+    "\n",
+    "gpu_num = '0'"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "5a00e5ad",
+   "metadata": {},
+   "source": [
+    "---------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "09aed4e3",
+   "metadata": {},
+   "source": [
+    "# Step 3"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "8e5e3f77",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "82b904a495de4f84b2246dfdbdd1f863",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "generation_config.json:   0%|          | 0.00/147 [00:00<?, ?B/s]"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "C:\\Users\\NTC\\anaconda3\\Lib\\site-packages\\huggingface_hub\\file_download.py:149: UserWarning: `huggingface_hub` cache-system uses symlinks by default to efficiently store duplicated files but your machine does not support them in C:\\Users\\NTC\\.cache\\huggingface\\hub\\models--t5-small. Caching files will still work but in a degraded version that might require more space on your disk. This warning can be disabled by setting the `HF_HUB_DISABLE_SYMLINKS_WARNING` environment variable. For more details, see https://huggingface.co/docs/huggingface_hub/how-to-cache#limitations.\n",
+      "To support symlinks on Windows, you either need to activate Developer Mode or to run Python as an administrator. In order to see activate developer mode, see this article: https://docs.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development\n",
+      "  warnings.warn(message)\n"
+     ]
+    }
+   ],
+   "source": [
+    "import os\n",
+    "import pandas as pd\n",
+    "from transformers import AutoModelForSeq2SeqLM, AutoTokenizer\n",
+    "\n",
+    "test_dataset_folder = r'C:\\Users\\NTC\\Desktop\\mine\\GRA\\LLMforTDD-main\\LLMforTDD-main'\n",
+    "\n",
+    "model_name = 't5-small'  \n",
+    "model_dir  = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/save/APPS/codet5-code-v2/checkpoint-183520'\n",
+    "\n",
+    "all_data = pd.DataFrame()\n",
+    "\n",
+    "try:\n",
+    "    csv_files = [file for file in os.listdir(test_dataset_folder) if file.endswith(\".csv\")]\n",
+    "\n",
+    "    for csv_file in csv_files:\n",
+    "        file_path = os.path.join(test_dataset_folder, csv_file)\n",
+    "        data = pd.read_csv(file_path, delimiter='\\t')\n",
+    "        all_data = pd.concat([all_data, data], ignore_index=True)\n",
+    "\n",
+    "    if os.path.isdir(model_dir):\n",
+    "        model = AutoModelForSeq2SeqLM.from_pretrained(model_dir)\n",
+    "        tokenizer = AutoTokenizer.from_pretrained(model_dir,\n",
+    "                                                  padding_side='left',\n",
+    "                                                  truncation_side='left',\n",
+    "                                                  do_lower_case=False)\n",
+    "    else:\n",
+    "        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)\n",
+    "        tokenizer = AutoTokenizer.from_pretrained(model_name,\n",
+    "                                                  padding_side='left',\n",
+    "                                                  truncation_side='left',\n",
+    "                                                  do_lower_case=False)\n",
+    "\n",
+    "    if model_name == 'gpt2':\n",
+    "        tokenizer.pad_token = tokenizer.eos_token\n",
+    "\n",
+    "except FileNotFoundError:\n",
+    "    print(\"Directory or file not found. Please check the directory path and file names.\")\n",
+    "except Exception as e:\n",
+    "    print(f\"An error occurred: {e}\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "3a8f192a",
+   "metadata": {},
+   "source": [
+    "---------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "251b3c92",
+   "metadata": {},
+   "source": [
+    "# Step 4"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "id": "719a655a",
+   "metadata": {
+    "scrolled": false
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Requirement already satisfied: tqdm in c:\\users\\ntc\\anaconda3\\lib\\site-packages (4.65.0)\n",
+      "Requirement already satisfied: colorama in c:\\users\\ntc\\anaconda3\\lib\\site-packages (from tqdm) (0.4.6)\n",
+      "Note: you may need to restart the kernel to use updated packages.\n"
+     ]
+    }
+   ],
+   "source": [
+    "pip install tqdm"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "id": "426ed3b6",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:46<00:00, 23.01s/it]\n"
+     ]
+    }
+   ],
+   "source": [
+    "import torch\n",
+    "from torch.utils.data import DataLoader, Dataset\n",
+    "from tqdm import tqdm\n",
+    "from transformers import AutoModelForCausalLM, AutoTokenizer\n",
+    "\n",
+    "class MyDataset(Dataset):\n",
+    "    def __init__(self, data, tokenizer, max_length):\n",
+    "        self.data = data\n",
+    "        self.tokenizer = tokenizer\n",
+    "        self.max_length = max_length\n",
+    "\n",
+    "    def __len__(self):\n",
+    "        return len(self.data)\n",
+    "\n",
+    "    def __getitem__(self, idx):\n",
+    "        item = self.data[idx]\n",
+    "        inputs = self.tokenizer(\n",
+    "            item, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt'\n",
+    "        )\n",
+    "        return {\n",
+    "            'input_ids': inputs['input_ids'].squeeze(),\n",
+    "            'attention_mask': inputs['attention_mask'].squeeze()\n",
+    "        }\n",
+    "\n",
+    "test_data = [\"Example input 1\", \"Example input 2\", \"Example input 3\"]\n",
+    "model_name = 'gpt2'\n",
+    "tokenizer = AutoTokenizer.from_pretrained(model_name)\n",
+    "tokenizer.pad_token = tokenizer.eos_token  \n",
+    "tokenizer.padding_side = 'left' \n",
+    "max_length = 512\n",
+    "batch_size = 2\n",
+    "max_new_tokens = 50\n",
+    "beam_size = 3\n",
+    "processed = True \n",
+    "\n",
+    "test_dataset = MyDataset(test_data, tokenizer, max_length)\n",
+    "test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)\n",
+    "\n",
+    "model = AutoModelForCausalLM.from_pretrained(model_name)\n",
+    "\n",
+    "predictions = []\n",
+    "raw_outputs = []\n",
+    "skip_special_tokens = not (processed and model_name in ['gpt2', 'codegpt', 'pycoder'])\n",
+    "\n",
+    "for batch in tqdm(test_loader):\n",
+    "    with torch.no_grad():\n",
+    "        input_ids = batch[\"input_ids\"].to('cpu')\n",
+    "        attention_mask = batch[\"attention_mask\"].to('cpu')\n",
+    "\n",
+    "        outputs = model.generate(\n",
+    "            input_ids=input_ids,\n",
+    "            attention_mask=attention_mask,\n",
+    "            pad_token_id=tokenizer.pad_token_id, \n",
+    "            max_new_tokens=max_new_tokens,\n",
+    "            num_return_sequences=beam_size,\n",
+    "            num_beams=beam_size,\n",
+    "            early_stopping=True,\n",
+    "            max_time=30\n",
+    "        )\n",
+    "\n",
+    "        outputs = outputs[:, input_ids.shape[-1]:]\n",
+    "        decoded_outputs = tokenizer.batch_decode(outputs, skip_special_tokens=skip_special_tokens, clean_up_tokenization_spaces=False)\n",
+    "\n",
+    "        processed_outputs = []\n",
+    "        for i in range(0, len(decoded_outputs), beam_size):\n",
+    "            batch_outputs = decoded_outputs[i:i+beam_size]\n",
+    "            processed_outputs.append(batch_outputs)\n",
+    "        predictions.extend(processed_outputs)\n",
+    "\n",
+    "        raw_outputs.append([outputs[i:i+beam_size] for i in range(0, len(outputs), beam_size)])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "155668b6",
+   "metadata": {},
+   "source": [
+    "---------------------------"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "1c582257",
+   "metadata": {},
+   "source": [
+    "# Step 5"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "id": "553cd232",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "         repo_id                                                url language  \\\n",
+      "0        3052688       https://github.com/kevinsawicki/stock-quotes     Java   \n",
+      "1       32247353  https://github.com/sandipchitale/sandipchitale...     Java   \n",
+      "2       93879423               https://github.com/uillianluiz/RUBiS     Java   \n",
+      "3       16372087       https://github.com/Erzer/polonium-chart-view     Java   \n",
+      "4       90233537      https://github.com/aliyun/apigateway-sdk-core     Java   \n",
+      "...          ...                                                ...      ...   \n",
+      "10088  134616422                https://github.com/palantir/conjure      NaN   \n",
+      "10089   51122075       https://github.com/evokly/kafka-connect-mqtt     Java   \n",
+      "10090   85227584                https://github.com/ccrama/Slide-RSS     Java   \n",
+      "10091  136475035       https://github.com/gaojulong/My_Licenseplate     Java   \n",
+      "10092   48880766              https://github.com/jtablesaw/tablesaw      NaN   \n",
+      "\n",
+      "       is_fork  fork_count  stargazer_count     size   license  num_instances  \\\n",
+      "0          0.0        13.0             18.0    579.0  licensed              2   \n",
+      "1          0.0         3.0              5.0   7355.0  licensed              0   \n",
+      "2          0.0         6.0              5.0   2197.0     Other              0   \n",
+      "3          0.0        10.0             19.0    919.0  licensed              0   \n",
+      "4          0.0         7.0              7.0     33.0  licensed              0   \n",
+      "...        ...         ...              ...      ...       ...            ...   \n",
+      "10088      NaN         NaN              NaN      NaN  licensed             28   \n",
+      "10089      0.0        69.0            140.0    111.0  licensed              0   \n",
+      "10090      0.0         1.0             14.0   1622.0  licensed              0   \n",
+      "10091      0.0         2.0              5.0  10828.0  licensed              0   \n",
+      "10092      NaN         NaN              NaN      NaN  licensed            440   \n",
+      "\n",
+      "        stars                      created                    updates   fork  \n",
+      "0         NaN                          NaN                        NaN    NaN  \n",
+      "1         NaN                          NaN                        NaN    NaN  \n",
+      "2         NaN                          NaN                        NaN    NaN  \n",
+      "3         NaN                          NaN                        NaN    NaN  \n",
+      "4         NaN                          NaN                        NaN    NaN  \n",
+      "...       ...                          ...                        ...    ...  \n",
+      "10088   211.0  5/23/2018 7:28:43 PM +00:00  2020-01-24T17:51:52+00:00  False  \n",
+      "10089     NaN                          NaN                        NaN    NaN  \n",
+      "10090     NaN                          NaN                        NaN    NaN  \n",
+      "10091     NaN                          NaN                        NaN    NaN  \n",
+      "10092  2021.0   1/1/2016 2:58:28 PM +00:00  2020-01-24T23:26:07+00:00  False  \n",
+      "\n",
+      "[10093 rows x 13 columns]\n"
+     ]
+    }
+   ],
+   "source": [
+    "df=pd.read_json('test.json')\n",
+    "print(df)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "id": "f314f00e",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "for df , prediction in zip(df, predictions):\n",
+    "    base_name = os.path.splitext(df)[0]\n",
+    "    output_txt_path = os.path.join(output_dir, f\"{base_name}{output_suffix}.txt\")\n",
+    "\n",
+    "    with open(output_txt_path, 'w') as f:\n",
+    "        for data in prediction:\n",
+    "            f.write(data + '\\n')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "0ee0f5b0",
+   "metadata": {},
+   "source": [
+    "---------------------------"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "f7426fae",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+
+import os
+import torch
+import glob
+import datasets
+import pickle
+import pandas as pd
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling, AutoModelForSeq2SeqLM, DataCollatorForSeq2Seq
+
+#########################
+######## config #########
+model_name = 'Salesforce/codet5-large'
+model_dir  = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/save/APPS/codet5-code-v2/checkpoint-183520'
+test_dataset_folder = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Dataset/Test'
+input_column = 'description' 
+output_column = 'test_case'
+processed = False
+
+output_dir = '/home/saranya/HDD18TB/RL/PyRL-text-to-testcase-main/Output/Sample'
+output_suffix = 'Test'
+
+batch_size = 4
+beam_size = 4
+max_new_tokens = 500  # Overwrite max_length
+max_length = 1024
+
+gpu_num = '0'
+
+
+# Initialize an empty DataFrame to store data from all CSV files
+all_data = pd.DataFrame()
+
+# List all CSV files in the directory
+csv_files = [file for file in os.listdir(test_dataset_folder) if file.endswith(".csv")]
+
+# Iterate through each CSV file and read it into a DataFrame
+for csv_file in csv_files:
+    file_path = os.path.join(test_dataset_folder, csv_file)
+    data = pd.read_csv(file_path, delimiter='\t')
+    all_data = all_data.append(data, ignore_index=True)
+
+# Load the trained model and initialize the tokenizer
+model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_dir,
+                                          padding_side='left',
+                                          truncation_side='left',
+                                          do_lower_case=False
+                                          )
+
+if model_name == 'gpt2':
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Tokenize the inputs for the test dataset
+test_inputs_text = list(all_data[input_column])
+test_inputs = tokenizer(test_inputs_text, padding=True, truncation=True, max_length=max_length)
+
+# Convert the tokenized inputs into a PyTorch dataset
+test_dataset = datasets.Dataset.from_dict({
+    "input_ids": test_inputs["input_ids"],
+    "attention_mask": test_inputs["attention_mask"],
+})
+
+# Create PyTorch dataloaders for the test dataset
+test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=DataCollatorForSeq2Seq(tokenizer) if 'bigscience/bloom-560m' in model_name else DataCollatorForLanguageModeling(tokenizer, mlm=False))
+
+# Generate predictions on the test dataset
+predictions = []
+raw_outputs = []
+skip_special_tokens = not (processed and model_name in ['gpt2', 'codegpt', 'pycoder'])
+
+for batch in tqdm(test_loader):
+    with torch.no_grad():
+        input_ids = batch["input_ids"].to('cpu')
+        attention_mask = batch["attention_mask"].to('cpu')
+
+        # Generate test case predictions
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pad_token_id=tokenizer.eos_token_id,
+            max_new_tokens=max_new_tokens,
+            num_return_sequences=beam_size,
+            num_beams=beam_size,
+            early_stopping=True,
+            max_time=30
+        )
+
+        # Post-process the generated outputs
+        outputs = outputs[:, input_ids.shape[-1]:]
+        decoded_outputs = tokenizer.batch_decode(outputs, skip_special_tokens=skip_special_tokens, clean_up_tokenization_spaces=False)
+
+        # Process decoded outputs to ensure correctness
+        processed_outputs = []
+        for i in range(0, len(decoded_outputs), beam_size):
+            batch_outputs = decoded_outputs[i:i+beam_size]
+            processed_outputs.append(batch_outputs)
+        predictions.extend(processed_outputs)
+
+        # Store raw outputs for debugging
+        raw_outputs.append([outputs[i:i+beam_size] for i in range(0, len(outputs), beam_size)])
+
+# Save predictions to text files with the same name as the input CSV files in the output folder
+for csv_file, prediction in zip(csv_files, predictions):
+    base_name = os.path.splitext(csv_file)[0]
+    output_txt_path = os.path.join(output_dir, f"{base_name}{output_suffix}.txt")
+
+    with open(output_txt_path, 'w') as f:
+        for data in prediction:
+            f.write(data + '\n')
+
+# Continue with any further processing or evaluation steps as needed
